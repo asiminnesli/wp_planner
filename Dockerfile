@@ -37,7 +37,7 @@ COPY --from=backend-builder /app/backend/prisma ./backend/prisma
 # Frontend (static files — backend serves these)
 COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
 
-# Data dizini (SQLite + Baileys auth)
+# Data dizini (SQLite + Baileys auth — volume mount noktası)
 RUN mkdir -p /app/backend/data
 
 WORKDIR /app/backend
