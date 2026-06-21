@@ -14,9 +14,8 @@ backend/prisma/*.db-journal
 dist/
 build/
 
-# WhatsApp session
-.wwebjs_auth/
-.wwebjs_cache/
+# WhatsApp session (Baileys)
+.baileys_auth/
 
 # IDE
 .vscode/
