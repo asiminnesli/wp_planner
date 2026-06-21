@@ -1,6 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
+import path from 'path';
 import { env } from './config/env';
 import authRoutes from './routes/auth.routes';
 import taskRoutes from './routes/task.routes';
@@ -11,7 +12,9 @@ import { WhatsAppClientService } from './services/whatsapp-client.service';
 const app = express();
 
 // Middleware
-app.use(helmet());
+app.use(helmet({
+  contentSecurityPolicy: false, // React SPA için CSP devre dışı
+}));
 app.use(cors({
   origin: env.FRONTEND_URL,
   credentials: true,
@@ -27,10 +30,21 @@ app.get('/api/health', (_req, res) => {
   });
 });
 
-// Routes
+// API Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/tasks', taskRoutes);
 app.use('/api/whatsapp', whatsappRoutes);
+
+// Production: Frontend static dosyalarını serve et
+if (env.NODE_ENV === 'production') {
+  const frontendPath = path.join(__dirname, '../../frontend/dist');
+  app.use(express.static(frontendPath));
+
+  // SPA fallback: API dışı tüm istekleri index.html'e yönlendir
+  app.get('*', (_req, res) => {
+    res.sendFile(path.join(frontendPath, 'index.html'));
+  });
+}
 
 // Global error handler
 app.use((err: Error, _req: express.Request, res: express.Response, _next: express.NextFunction) => {

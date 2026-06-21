@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: wp-planner
+    runtime: node
+    region: frankfurt
+    plan: starter
+    buildCommand: npm run install:all && npm run build
+    startCommand: npm run start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        value: file:./data/prod.db
+      - key: JWT_SECRET
+        generateValue: true
+      - key: JWT_EXPIRES_IN
+        value: 7d
+      - key: GEMINI_API_KEY
+        value: optional
+      - key: PORT
+        value: 10000
+      - key: FRONTEND_URL
+        sync: false
+    disk:
+      name: wp-planner-data
+      mountPath: /opt/render/project/src/backend/data
+      sizeGB: 1

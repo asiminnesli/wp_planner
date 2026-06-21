@@ -1,0 +1,15 @@
+{
+  "name": "wp-planner",
+  "version": "1.0.0",
+  "private": true,
+  "description": "AI-Powered WhatsApp Task Manager",
+  "scripts": {
+    "install:all": "cd backend && npm install && cd ../frontend && npm install",
+    "build": "cd frontend && npm run build && cd ../backend && npx prisma generate && npx prisma migrate deploy && npm run build",
+    "start": "cd backend && npm run start",
+    "dev": "echo 'Run backend and frontend separately with npm run dev'"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

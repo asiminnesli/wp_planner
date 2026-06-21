@@ -15,8 +15,10 @@ import pino from 'pino';
 
 type RepeatType = 'ONCE' | 'DAILY' | 'WEEKLY' | 'MONTHLY' | 'INTERVAL';
 
-const AUTH_DIR = path.join(process.cwd(), '.baileys_auth');
-const logger = pino({ level: 'warn' }); // Hata ve uyarıları göster
+const AUTH_DIR = process.env.NODE_ENV === 'production'
+  ? path.join(process.cwd(), 'data', 'baileys_auth')
+  : path.join(process.cwd(), '.baileys_auth');
+const logger = pino({ level: process.env.NODE_ENV === 'production' ? 'error' : 'warn' });
 
 let sock: WASocket | null = null;
 
