@@ -4,6 +4,7 @@ import makeWASocket, {
   WASocket,
   proto,
   makeCacheableSignalKeyStore,
+  getAggregateVotesInPollMessage,
 } from '@whiskeysockets/baileys';
 import { Boom } from '@hapi/boom';
 import { GeminiService } from './gemini.service';
@@ -180,29 +181,47 @@ export class WhatsAppClientService {
     sock.ev.on('messages.update', async (updates) => {
       for (const update of updates) {
         try {
-          if (!update.update?.pollUpdates) continue;
+          const pollUpdates = update.update?.pollUpdates;
+          if (!pollUpdates || pollUpdates.length === 0) continue;
+
+          console.log(`📊 messages.update: pollUpdates alındı (${pollUpdates.length} update)`);
 
           const pollKey = update.key;
-          const originalMsg = msgStore.get(getMsgKey(pollKey));
-          if (!originalMsg?.message?.pollCreationMessage) continue;
+          const storeKey = getMsgKey(pollKey);
+          const originalMsg = msgStore.get(storeKey);
 
-          const { getAggregateVotesInPollMessage } = await import('@whiskeysockets/baileys');
+          if (!originalMsg) {
+            console.log(`⚠️ Poll orijinal mesajı store'da bulunamadı: ${storeKey}`);
+            console.log(`📝 Store'daki key sayısı: ${msgStore.size}`);
+            continue;
+          }
+
+          if (!originalMsg.message?.pollCreationMessage) {
+            console.log(`⚠️ Orijinal mesaj poll değil`);
+            continue;
+          }
+
           const pollVotes = getAggregateVotesInPollMessage({
             message: originalMsg.message,
-            pollUpdates: update.update.pollUpdates,
+            pollUpdates,
           });
+
+          console.log(`📊 Poll sonuçları:`, JSON.stringify(pollVotes.map(v => ({ name: v.name, voters: v.voters.length }))));
 
           // En çok oy alan seçeneği bul
           const topVote = pollVotes.sort((a, b) => b.voters.length - a.voters.length)[0];
-          if (!topVote || topVote.voters.length === 0) continue;
+          if (!topVote || topVote.voters.length === 0) {
+            console.log(`⚠️ Poll'da oy yok veya boş`);
+            continue;
+          }
 
           const selectedOption = topVote.name;
           const jid = pollKey.remoteJid || '';
 
-          console.log(`📊 Poll cevabı: "${selectedOption}"`);
+          console.log(`✅ Poll seçimi: "${selectedOption}" → handleInteractiveResponse`);
           await WhatsAppClientService.handleInteractiveResponse(jid, selectedOption);
         } catch (err: any) {
-          console.error('❌ Poll güncelleme hatası:', err.message);
+          console.error('❌ Poll güncelleme hatası:', err.message, err.stack);
         }
       }
     });
@@ -697,10 +716,10 @@ export class WhatsAppClientService {
           }
           WhatsAppClientService.pendingTasks.delete(phone);
         } else if (pending.type === 'media_confirmation') {
-          // Medya onay cevabı
+          // Medya onay cevabı (metin veya poll seçenek metni)
           const lower = text.toLowerCase().trim();
 
-          if (lower === 'evet' || lower === 'onay' || lower === 'e' || lower === 'tamam' || lower === 'onayla') {
+          if (lower === 'evet' || lower === 'onay' || lower === 'e' || lower === 'tamam' || lower === 'onayla' || text.trim() === 'Onayla ✅') {
             // Tüm görevleri oluştur
             const actions = pending.proposedActions || [];
             const createdTasks: string[] = [];
@@ -735,14 +754,18 @@ export class WhatsAppClientService {
             await WhatsAppClientService.reply(jid, phone, reply);
             WhatsAppClientService.pendingTasks.delete(phone);
             return;
-          } else if (lower === 'hayır' || lower === 'iptal' || lower === 'h' || lower === 'vazgeç') {
+          } else if (lower === 'hayır' || lower === 'iptal' || lower === 'h' || lower === 'vazgeç' || text.trim() === 'İptal ❌') {
             await WhatsAppClientService.reply(jid, phone, '❌ Görevler iptal edildi.');
             WhatsAppClientService.pendingTasks.delete(phone);
             return;
+          } else if (lower === 'düzenle' || lower === 'düzelt' || text.trim() === 'Düzenle ✏️') {
+            await WhatsAppClientService.reply(jid, phone, '✏️ Düzenlemek istediğiniz görevleri yazıyla belirtin veya medyayı tekrar gönderin.');
+            WhatsAppClientService.pendingTasks.delete(phone);
+            return;
           } else {
-            // Düzenleme veya başka bir cevap — ipucu ver
+            // Farklı bir cevap — ipucu ver
             await WhatsAppClientService.reply(jid, phone,
-              '📝 Görevleri onaylamak için *evet*, iptal etmek için *hayır* yazın.\n\nFarklı görevler istiyorsanız medyayı tekrar gönderin veya yazıyla belirtin.'
+              '📝 Anketten bir seçenek seçin veya *evet* / *hayır* yazın.'
             );
             return;
           }
