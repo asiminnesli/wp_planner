@@ -22,6 +22,13 @@ const logger = pino({ level: process.env.NODE_ENV === 'production' ? 'error' : '
 
 let sock: WASocket | null = null;
 
+// In-memory message store — poll cevaplarını decrypt etmek için gerekli
+const msgStore = new Map<string, proto.IWebMessageInfo>();
+
+function getMsgKey(key: proto.IMessageKey): string {
+  return `${key.remoteJid}_${key.id}`;
+}
+
 export class WhatsAppClientService {
   private static isReady = false;
   private static myJid = '';        // Kendi JID'imiz (905xx@s.whatsapp.net)
@@ -69,6 +76,10 @@ export class WhatsAppClientService {
       browser: ['WP Planner', 'Safari', '3.0'],
       syncFullHistory: false,
       markOnlineOnConnect: false,
+      getMessage: async (key) => {
+        const stored = msgStore.get(getMsgKey(key));
+        return stored?.message || undefined;
+      },
     });
 
     // QR kodu geldiğinde sakla
@@ -132,27 +143,15 @@ export class WhatsAppClientService {
           if (remoteJid === 'status@broadcast') continue;
           if (remoteJid.endsWith('@g.us')) continue;
 
+          // Tüm mesajları store'a kaydet (poll decrypt için gerekli)
+          if (msg.key) msgStore.set(getMsgKey(msg.key), msg);
+
           // Self-chat kontrolü
           const myNumber = WhatsAppClientService.myJid.split('@')[0];
           const myLidNumber = WhatsAppClientService.myLid.split('@')[0];
           const remoteNumber = remoteJid.split('@')[0];
           const isSelfChat = (myNumber === remoteNumber) || (myLidNumber && myLidNumber === remoteNumber);
           if (!isSelfChat) continue;
-
-          // Interactive response kontrolü (list/button seçimleri)
-          const listResponse = msg.message?.listResponseMessage;
-          const buttonResponse = msg.message?.buttonsResponseMessage;
-
-          if (listResponse || buttonResponse) {
-            const selectedId = listResponse?.singleSelectReply?.selectedRowId
-              || buttonResponse?.selectedButtonId
-              || '';
-            if (selectedId) {
-              console.log(`🔘 Interactive seçim alındı: ${selectedId}`);
-              await WhatsAppClientService.handleInteractiveResponse(remoteJid, selectedId);
-              continue;
-            }
-          }
 
           // Metin mesajı
           const text = msg.message?.conversation
@@ -173,6 +172,37 @@ export class WhatsAppClientService {
           }
         } catch (err: any) {
           console.error('❌ Mesaj işleme hatası:', err.message);
+        }
+      }
+    });
+
+    // Poll oy güncellemelerini dinle
+    sock.ev.on('messages.update', async (updates) => {
+      for (const update of updates) {
+        try {
+          if (!update.update?.pollUpdates) continue;
+
+          const pollKey = update.key;
+          const originalMsg = msgStore.get(getMsgKey(pollKey));
+          if (!originalMsg?.message?.pollCreationMessage) continue;
+
+          const { getAggregateVotesInPollMessage } = await import('@whiskeysockets/baileys');
+          const pollVotes = getAggregateVotesInPollMessage({
+            message: originalMsg.message,
+            pollUpdates: update.update.pollUpdates,
+          });
+
+          // En çok oy alan seçeneği bul
+          const topVote = pollVotes.sort((a, b) => b.voters.length - a.voters.length)[0];
+          if (!topVote || topVote.voters.length === 0) continue;
+
+          const selectedOption = topVote.name;
+          const jid = pollKey.remoteJid || '';
+
+          console.log(`📊 Poll cevabı: "${selectedOption}"`);
+          await WhatsAppClientService.handleInteractiveResponse(jid, selectedOption);
+        } catch (err: any) {
+          console.error('❌ Poll güncelleme hatası:', err.message);
         }
       }
     });
@@ -248,109 +278,66 @@ export class WhatsAppClientService {
     WhatsAppClientService.addToHistory(phone, 'bot', cleanText.substring(0, 200));
   }
 
-  // ==================== INTERACTIVE MESSAGES ====================
+  // ==================== POLL MESSAGES ====================
 
   /**
-   * Interactive List mesajı gönder (anket tarzı seçim listesi)
-   * Fallback: Desteklenmezse düz metin olarak gönderir
+   * WhatsApp Poll mesajı gönder (Baileys'de çalışan anket)
+   * selectableCount=1 → tek seçim (radio button gibi)
    */
-  private static async sendListMessage(
+  private static async sendPollMessage(
     jid: string,
     phone: string,
-    body: string,
-    buttonText: string,
-    sections: Array<{ title: string; rows: Array<{ title: string; rowId: string; description?: string }> }>,
-    footer?: string,
+    question: string,
+    options: string[],
+    selectableCount: number = 1,
   ): Promise<void> {
     if (!sock) return;
     try {
-      const listMsg: any = {
-        text: body,
-        footer: footer || '',
-        title: '',
-        buttonText,
-        sections,
-      };
-      await sock.sendMessage(jid, listMsg);
-      WhatsAppClientService.addToHistory(phone, 'bot', body.substring(0, 200));
-    } catch (err: any) {
-      console.warn('⚠️ Interactive list gönderilemedi, düz metin fallback:', err.message);
-      // Fallback: düz metin olarak gönder
-      let fallbackText = body + '\n';
-      for (const section of sections) {
-        if (section.title) fallbackText += `\n*${section.title}*\n`;
-        section.rows.forEach((row, i) => {
-          fallbackText += `${i + 1}. ${row.title}${row.description ? ` — ${row.description}` : ''}\n`;
-        });
-      }
-      if (footer) fallbackText += `\n_${footer}_`;
-      await WhatsAppClientService.reply(jid, phone, fallbackText);
-    }
-  }
-
-  /**
-   * Button mesajı gönder (max 3 buton)
-   * Fallback: Desteklenmezse düz metin olarak gönderir
-   */
-  private static async sendButtonMessage(
-    jid: string,
-    phone: string,
-    body: string,
-    buttons: Array<{ buttonId: string; buttonText: string }>,
-    footer?: string,
-  ): Promise<void> {
-    if (!sock) return;
-    try {
-      const buttonMsg: any = {
-        text: body,
-        footer: footer || '',
-        buttons: buttons.map(b => ({
-          buttonId: b.buttonId,
-          buttonText: { displayText: b.buttonText },
-          type: 1,
-        })),
-        headerType: 1,
-      };
-      await sock.sendMessage(jid, buttonMsg);
-      WhatsAppClientService.addToHistory(phone, 'bot', body.substring(0, 200));
-    } catch (err: any) {
-      console.warn('⚠️ Button mesaj gönderilemedi, düz metin fallback:', err.message);
-      // Fallback: düz metin olarak gönder
-      let fallbackText = body + '\n\n';
-      buttons.forEach(b => {
-        fallbackText += `• *${b.buttonText}*\n`;
+      const sentMsg = await sock.sendMessage(jid, {
+        poll: {
+          name: question,
+          values: options,
+          selectableCount,
+        },
       });
-      if (footer) fallbackText += `\n_${footer}_`;
+      // Poll mesajını store'a kaydet (oy decrypt için)
+      if (sentMsg?.key) {
+        msgStore.set(getMsgKey(sentMsg.key), sentMsg);
+      }
+      WhatsAppClientService.addToHistory(phone, 'bot', `[Poll: ${question}]`);
+    } catch (err: any) {
+      console.error('❌ Poll gönderilemedi:', err.message);
+      // Fallback: düz metin
+      let fallbackText = `📊 *${question}*\n\n`;
+      options.forEach((opt, i) => {
+        fallbackText += `${i + 1}. ${opt}\n`;
+      });
       await WhatsAppClientService.reply(jid, phone, fallbackText);
     }
   }
 
-  // ==================== INTERACTIVE RESPONSE HANDLER ====================
+  // ==================== POLL RESPONSE HANDLER ====================
 
-  private static async handleInteractiveResponse(jid: string, selectedId: string): Promise<void> {
+  private static async handleInteractiveResponse(jid: string, selectedOption: string): Promise<void> {
     try {
       const phone = WhatsAppClientService.myJid.split('@')[0];
-      console.log(`🔘 Interactive seçim: ${selectedId}`);
-      WhatsAppClientService.addToHistory(phone, 'user', `[Seçim: ${selectedId}]`);
+      console.log(`📊 Poll seçim: ${selectedOption}`);
+      WhatsAppClientService.addToHistory(phone, 'user', `[Seçim: ${selectedOption}]`);
 
       const pending = WhatsAppClientService.pendingTasks.get(phone);
 
       // ── Interval seçimi ──
-      if (selectedId.startsWith('interval_')) {
-        if (!pending || pending.type !== 'interval') {
-          await WhatsAppClientService.reply(jid, phone, '⚠️ Aktif bir görev oluşturma işlemi yok.');
-          return;
-        }
+      if (pending?.type === 'interval') {
         const intervalMap: Record<string, { repeatType: RepeatType; intervalDays: number | null }> = {
-          'interval_once': { repeatType: 'ONCE', intervalDays: null },
-          'interval_daily': { repeatType: 'DAILY', intervalDays: null },
-          'interval_weekly': { repeatType: 'WEEKLY', intervalDays: null },
-          'interval_monthly': { repeatType: 'MONTHLY', intervalDays: null },
+          'Tek Seferlik': { repeatType: 'ONCE', intervalDays: null },
+          'Günlük': { repeatType: 'DAILY', intervalDays: null },
+          'Haftalık': { repeatType: 'WEEKLY', intervalDays: null },
+          'Aylık': { repeatType: 'MONTHLY', intervalDays: null },
         };
 
-        const selected = intervalMap[selectedId];
+        const selected = intervalMap[selectedOption];
         if (!selected) {
-          // interval_custom → kullanıcıdan yazarak almamız gerekiyor
+          // Özel Aralık seçildi
           await WhatsAppClientService.reply(jid, phone, '📝 Kaç günde bir tekrar etsin? Örn: *45 günde bir*');
           return;
         }
@@ -379,13 +366,8 @@ export class WhatsAppClientService {
       }
 
       // ── Medya onay seçimi ──
-      if (selectedId.startsWith('media_')) {
-        if (!pending || pending.type !== 'media_confirmation') {
-          await WhatsAppClientService.reply(jid, phone, '⚠️ Aktif bir onay bekleyen işlem yok.');
-          return;
-        }
-
-        if (selectedId === 'media_yes') {
+      if (pending?.type === 'media_confirmation') {
+        if (selectedOption === 'Onayla ✅') {
           const actions = pending.proposedActions || [];
           const createdTasks: string[] = [];
           for (const a of actions) {
@@ -417,11 +399,11 @@ export class WhatsAppClientService {
           await WhatsAppClientService.reply(jid, phone, reply);
           WhatsAppClientService.pendingTasks.delete(phone);
           return;
-        } else if (selectedId === 'media_no') {
+        } else if (selectedOption === 'İptal ❌') {
           await WhatsAppClientService.reply(jid, phone, '❌ Görevler iptal edildi.');
           WhatsAppClientService.pendingTasks.delete(phone);
           return;
-        } else if (selectedId === 'media_edit') {
+        } else if (selectedOption === 'Düzenle ✏️') {
           await WhatsAppClientService.reply(jid, phone, '✏️ Düzenlemek istediğiniz görevleri yazıyla belirtin veya medyayı tekrar gönderin.');
           WhatsAppClientService.pendingTasks.delete(phone);
           return;
@@ -429,36 +411,50 @@ export class WhatsAppClientService {
       }
 
       // ── Görev tamamlama seçimi ──
-      if (selectedId.startsWith('complete_task_')) {
-        const taskId = selectedId.replace('complete_task_', '');
+      if (pending?.type === 'task_complete_select') {
         const userData = await TaskService.findTasksByUserPhone(phone);
         if (!userData) return;
-        const { user } = userData;
+        const { user, tasks } = userData;
 
-        try {
-          const completed = await TaskService.complete(taskId, user.id);
-          let cReply = `🎉 Tebrikler! Görev tamamlandı:\n\n*${completed.title}*`;
-          if (completed.nextDueAt) {
-            cReply += `\n\n📅 Sonraki tarih: ${completed.nextDueAt.toLocaleDateString('tr-TR')}`;
+        const matchingTask = tasks.find(t =>
+          t.title.substring(0, 24) === selectedOption || t.title === selectedOption
+        );
+        if (matchingTask) {
+          try {
+            const completed = await TaskService.complete(matchingTask.id, user.id);
+            let cReply = `🎉 Tebrikler! Görev tamamlandı:\n\n*${completed.title}*`;
+            if (completed.nextDueAt) {
+              cReply += `\n\n📅 Sonraki tarih: ${completed.nextDueAt.toLocaleDateString('tr-TR')}`;
+            }
+            await WhatsAppClientService.reply(jid, phone, cReply);
+          } catch {
+            await WhatsAppClientService.reply(jid, phone, '❓ Görev bulunamadı veya zaten tamamlanmış.');
           }
-          await WhatsAppClientService.reply(jid, phone, cReply);
-        } catch {
-          await WhatsAppClientService.reply(jid, phone, '❓ Görev bulunamadı veya zaten tamamlanmış.');
+        } else {
+          await WhatsAppClientService.reply(jid, phone, '❓ Eşleşen görev bulunamadı.');
         }
         WhatsAppClientService.pendingTasks.delete(phone);
         return;
       }
 
       // ── Görev filtre seçimi ──
-      if (selectedId.startsWith('filter_')) {
+      const filterMap: Record<string, string> = {
+        'Bugünkü Görevler': 'today',
+        'Yarınki Görevler': 'tomorrow',
+        'Bu Hafta': 'week',
+        'Tüm Görevler': 'all',
+        'Zamansız Görevler': 'timeless',
+      };
+      const filterType = filterMap[selectedOption];
+      if (filterType) {
         const userData = await TaskService.findTasksByUserPhone(phone);
         if (!userData) return;
-        const { user, tasks } = userData;
+        const { tasks } = userData;
 
         let tasksToList = tasks;
         let listTitle = '*Görevleriniz*';
 
-        if (selectedId === 'filter_today') {
+        if (filterType === 'today') {
           const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
           const todayEnd = new Date(); todayEnd.setHours(23, 59, 59, 999);
           tasksToList = tasks.filter(t => {
@@ -467,7 +463,7 @@ export class WhatsAppClientService {
             return d >= todayStart && d <= todayEnd;
           });
           listTitle = `*Bugünkü Görevleriniz* 📅`;
-        } else if (selectedId === 'filter_tomorrow') {
+        } else if (filterType === 'tomorrow') {
           const tmrw = new Date(); tmrw.setDate(tmrw.getDate() + 1);
           tmrw.setHours(0, 0, 0, 0);
           const tmrwEnd = new Date(tmrw); tmrwEnd.setHours(23, 59, 59, 999);
@@ -477,18 +473,17 @@ export class WhatsAppClientService {
             return d >= tmrw && d <= tmrwEnd;
           });
           listTitle = `*Yarınki Görevleriniz* 📅`;
-        } else if (selectedId === 'filter_week') {
+        } else if (filterType === 'week') {
           const weekEnd = new Date(); weekEnd.setDate(weekEnd.getDate() + 7);
           tasksToList = tasks.filter(t => {
             if (!t.nextDueAt) return false;
             return new Date(t.nextDueAt) <= weekEnd;
           });
           listTitle = `*Bu Haftaki Görevleriniz* 📅`;
-        } else if (selectedId === 'filter_timeless') {
+        } else if (filterType === 'timeless') {
           tasksToList = tasks.filter(t => !t.nextDueAt);
           listTitle = `*Zamansız Görevleriniz* ⏳`;
         }
-        // filter_all → tasksToList zaten tüm görevler
 
         if (tasksToList.length === 0) {
           await WhatsAppClientService.reply(jid, phone, `📭 ${listTitle} — Bekleyen göreviniz yok!`);
@@ -507,12 +502,12 @@ export class WhatsAppClientService {
         return;
       }
 
-      // Bilinmeyen interactive response
-      await WhatsAppClientService.reply(jid, phone, '❓ Seçim anlaşılamadı. Lütfen tekrar deneyin.');
     } catch (error: any) {
-      console.error('❌ Interactive response hatası:', error.message);
+      console.error('❌ Poll response hatası:', error.message);
     }
   }
+
+
 
   // Send message to a phone number (used by scheduler)
   static async sendMessage(phone: string, text: string): Promise<void> {
@@ -611,17 +606,12 @@ export class WhatsAppClientService {
         createdAt: Date.now(),
       });
 
-      // Interactive button mesajı ile onay iste
-      await WhatsAppClientService.sendButtonMessage(
+      // Poll ile onay iste
+      await WhatsAppClientService.sendPollMessage(
         jid,
         phone,
-        preview,
-        [
-          { buttonId: 'media_yes', buttonText: 'Onayla ✅' },
-          { buttonId: 'media_no', buttonText: 'İptal ❌' },
-          { buttonId: 'media_edit', buttonText: 'Düzenle ✏️' },
-        ],
-        'Görevleri onaylamak için bir seçenek seçin',
+        preview + '\nNe yapmak istersiniz?',
+        ['Onayla ✅', 'İptal ❌', 'Düzenle ✏️'],
       );
     } catch (error: any) {
       console.error('❌ Medya işleme hatası:', error.message);
@@ -805,23 +795,12 @@ export class WhatsAppClientService {
                 userId: user.id,
                 createdAt: Date.now(),
               });
-              // Interactive list ile tekrar sıklığı sor
-              await WhatsAppClientService.sendListMessage(
+              // Poll ile tekrar sıklığı sor
+              await WhatsAppClientService.sendPollMessage(
                 jid,
                 phone,
-                `📝 *${action.title}*\n\nBu görev ne sıklıkla tekrar etsin?`,
-                'Sıklık Seçin 🔁',
-                [{
-                  title: 'Tekrar Sıklığı',
-                  rows: [
-                    { title: 'Tek Seferlik', rowId: 'interval_once', description: 'Sadece bir kere' },
-                    { title: 'Günlük', rowId: 'interval_daily', description: 'Her gün tekrar eder' },
-                    { title: 'Haftalık', rowId: 'interval_weekly', description: 'Her hafta tekrar eder' },
-                    { title: 'Aylık', rowId: 'interval_monthly', description: 'Her ay tekrar eder' },
-                    { title: 'Özel Aralık', rowId: 'interval_custom', description: 'Örn: 45 günde bir' },
-                  ],
-                }],
-                'Bir seçenek seçin',
+                `📝 ${action.title} — ne sıklıkla tekrar etsin?`,
+                ['Tek Seferlik', 'Günlük', 'Haftalık', 'Aylık', 'Özel Aralık'],
               );
               break;
             }
@@ -942,22 +921,11 @@ export class WhatsAppClientService {
                   userId: user.id,
                   createdAt: Date.now(),
                 });
-                await WhatsAppClientService.sendListMessage(
+                await WhatsAppClientService.sendPollMessage(
                   jid,
                   phone,
                   '🎯 Hangi görevi tamamladınız?',
-                  'Görev Seçin ✅',
-                  [{
-                    title: 'Aktif Görevler',
-                    rows: tasks.slice(0, 10).map((t, i) => ({
-                      title: t.title.substring(0, 24),
-                      rowId: `complete_task_${t.id}`,
-                      description: t.nextDueAt
-                        ? `📅 ${t.nextDueAt.toLocaleDateString('tr-TR')}${(t as any).dueTime ? ` ⏰${(t as any).dueTime}` : ''}`
-                        : '⏳ Zamansız',
-                    })),
-                  }],
-                  'Tamamlamak istediğiniz görevi seçin',
+                  tasks.slice(0, 10).map(t => t.title.substring(0, 24)),
                 );
               } else {
                 await WhatsAppClientService.reply(jid, phone,
@@ -979,22 +947,11 @@ export class WhatsAppClientService {
           case 'list_tasks': {
             // Belirli bir tarih veya filtre yoksa → interactive filtre sun
             if (!action.date) {
-              await WhatsAppClientService.sendListMessage(
+              await WhatsAppClientService.sendPollMessage(
                 jid,
                 phone,
                 '📋 Görevlerinizi nasıl listelemek istersiniz?',
-                'Filtre Seçin 📊',
-                [{
-                  title: 'Görev Filtresi',
-                  rows: [
-                    { title: 'Bugünkü Görevler', rowId: 'filter_today', description: '📅 Bugün yapılacaklar' },
-                    { title: 'Yarınki Görevler', rowId: 'filter_tomorrow', description: '📅 Yarın yapılacaklar' },
-                    { title: 'Bu Hafta', rowId: 'filter_week', description: '📅 7 gün içindekiler' },
-                    { title: 'Tüm Görevler', rowId: 'filter_all', description: '📋 Tüm bekleyen görevler' },
-                    { title: 'Zamansız Görevler', rowId: 'filter_timeless', description: '⏳ Tarihi belirsiz görevler' },
-                  ],
-                }],
-                'Görmek istediğiniz görevleri seçin',
+                ['Bugünkü Görevler', 'Yarınki Görevler', 'Bu Hafta', 'Tüm Görevler', 'Zamansız Görevler'],
               );
               break;
             }
