@@ -38,6 +38,7 @@ model Task {
   isFlexible         Boolean   @default(false) @map("is_flexible")
   dueTime            String?   @map("due_time")
   location           String?
+  isReminder         Boolean   @default(false) @map("is_reminder")
   createdAt          DateTime @default(now()) @map("created_at")
   updatedAt          DateTime @updatedAt @map("updated_at")
 

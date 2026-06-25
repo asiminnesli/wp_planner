@@ -6,10 +6,11 @@ export class SchedulerService {
   static start(): void {
     console.log('⏰ Zamanlayıcı başlatıldı');
 
-    // Her dakika çalış — 3 kontrol yapar:
-    // 1. Saatli görev hatırlatma (30 dk önce)
-    // 2. Gün başlangıcı → bugünkü görevler
-    // 3. Gün bitişi - 30dk → bitmemiş görevler
+    // Her dakika çalış — 4 kontrol yapar:
+    // 1. ⏰ Hatırlatma/alarm (tam saatinde bildirim)
+    // 2. Saatli görev hatırlatma (30 dk önce)
+    // 3. Gün başlangıcı → bugünkü görevler
+    // 4. Gün bitişi - 30dk → bitmemiş görevler
     cron.schedule('* * * * *', async () => {
       try {
         const now = new Date();
@@ -17,13 +18,16 @@ export class SchedulerService {
         const currentMM = String(now.getMinutes()).padStart(2, '0');
         const currentTime = `${currentHH}:${currentMM}`;
 
-        // === 1. Saatli görev hatırlatma (30 dk önce) ===
+        // === 1. Alarm/Hatırlatma (tam saatinde) ===
+        await checkReminderAlarms(now, currentTime);
+
+        // === 2. Saatli görev hatırlatma (30 dk önce) ===
         await checkTimedTaskReminders(now);
 
-        // === 2. Gün başlangıcı → bugünkü görevler ===
+        // === 3. Gün başlangıcı → bugünkü görevler ===
         await checkDayStart(currentTime);
 
-        // === 3. Gün bitişi - 30dk → bitmemiş görevler ===
+        // === 4. Gün bitişi - 30dk → bitmemiş görevler ===
         await checkDayEnd(currentTime);
       } catch (error: any) {
         console.error('❌ Zamanlayıcı hatası:', error.message);
@@ -162,6 +166,41 @@ async function checkDayEnd(currentTime: string) {
       text += `\n⏰ Gün bitiş: ${user.dayEndTime}`;
       await WhatsAppClientService.sendMessage(user.phone, text);
       console.log(`🌙 Gün sonu hatırlatma: ${user.name} → ${user.phone}`);
+    }
+  }
+}
+
+// Tam saatinde hatırlatma/alarm gönder (isReminder=true olan görevler)
+async function checkReminderAlarms(now: Date, currentTime: string) {
+  const todayStart = new Date(now);
+  todayStart.setHours(0, 0, 0, 0);
+  const todayEnd = new Date(now);
+  todayEnd.setHours(23, 59, 59, 999);
+
+  const reminders = await prisma.task.findMany({
+    where: {
+      isReminder: true,
+      dueTime: currentTime,
+      status: { not: 'COMPLETED' },
+      nextDueAt: {
+        gte: todayStart,
+        lte: todayEnd,
+      },
+    },
+    include: { user: { select: { phone: true, name: true } } },
+  });
+
+  for (const task of reminders) {
+    if (task.user.phone) {
+      const text = `|🔔 *HATIRLATMA!*\n\n*${task.title}*\n\n⏰ Saat: ${task.dueTime}\n\n_Bu hatırlatıcıyı siz kurdunuz._`;
+      await WhatsAppClientService.sendMessage(task.user.phone, text);
+      console.log(`🔔 Alarm gönderildi: ${task.title} → ${task.user.phone}`);
+
+      // Hatırlatma görevini tamamlandı olarak işaretle
+      await prisma.task.update({
+        where: { id: task.id },
+        data: { status: 'COMPLETED', lastCompletedAt: now },
+      });
     }
   }
 }

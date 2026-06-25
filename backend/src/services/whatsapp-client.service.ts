@@ -139,6 +139,21 @@ export class WhatsAppClientService {
           const isSelfChat = (myNumber === remoteNumber) || (myLidNumber && myLidNumber === remoteNumber);
           if (!isSelfChat) continue;
 
+          // Interactive response kontrolü (list/button seçimleri)
+          const listResponse = msg.message?.listResponseMessage;
+          const buttonResponse = msg.message?.buttonsResponseMessage;
+
+          if (listResponse || buttonResponse) {
+            const selectedId = listResponse?.singleSelectReply?.selectedRowId
+              || buttonResponse?.selectedButtonId
+              || '';
+            if (selectedId) {
+              console.log(`🔘 Interactive seçim alındı: ${selectedId}`);
+              await WhatsAppClientService.handleInteractiveResponse(remoteJid, selectedId);
+              continue;
+            }
+          }
+
           // Metin mesajı
           const text = msg.message?.conversation
             || msg.message?.extendedTextMessage?.text
@@ -186,7 +201,7 @@ export class WhatsAppClientService {
   // ==================== CONVERSATION & STATE ====================
 
   private static pendingTasks = new Map<string, {
-    type: 'interval' | 'clarification' | 'media_confirmation';
+    type: 'interval' | 'clarification' | 'media_confirmation' | 'task_filter' | 'task_complete_select';
     title: string;
     date: string | null;
     time: string | null;
@@ -231,6 +246,272 @@ export class WhatsAppClientService {
     const cleanText = text.startsWith('|') ? text.substring(1) : text;
     await sock.sendMessage(jid, { text: cleanText });
     WhatsAppClientService.addToHistory(phone, 'bot', cleanText.substring(0, 200));
+  }
+
+  // ==================== INTERACTIVE MESSAGES ====================
+
+  /**
+   * Interactive List mesajı gönder (anket tarzı seçim listesi)
+   * Fallback: Desteklenmezse düz metin olarak gönderir
+   */
+  private static async sendListMessage(
+    jid: string,
+    phone: string,
+    body: string,
+    buttonText: string,
+    sections: Array<{ title: string; rows: Array<{ title: string; rowId: string; description?: string }> }>,
+    footer?: string,
+  ): Promise<void> {
+    if (!sock) return;
+    try {
+      const listMsg: any = {
+        text: body,
+        footer: footer || '',
+        title: '',
+        buttonText,
+        sections,
+      };
+      await sock.sendMessage(jid, listMsg);
+      WhatsAppClientService.addToHistory(phone, 'bot', body.substring(0, 200));
+    } catch (err: any) {
+      console.warn('⚠️ Interactive list gönderilemedi, düz metin fallback:', err.message);
+      // Fallback: düz metin olarak gönder
+      let fallbackText = body + '\n';
+      for (const section of sections) {
+        if (section.title) fallbackText += `\n*${section.title}*\n`;
+        section.rows.forEach((row, i) => {
+          fallbackText += `${i + 1}. ${row.title}${row.description ? ` — ${row.description}` : ''}\n`;
+        });
+      }
+      if (footer) fallbackText += `\n_${footer}_`;
+      await WhatsAppClientService.reply(jid, phone, fallbackText);
+    }
+  }
+
+  /**
+   * Button mesajı gönder (max 3 buton)
+   * Fallback: Desteklenmezse düz metin olarak gönderir
+   */
+  private static async sendButtonMessage(
+    jid: string,
+    phone: string,
+    body: string,
+    buttons: Array<{ buttonId: string; buttonText: string }>,
+    footer?: string,
+  ): Promise<void> {
+    if (!sock) return;
+    try {
+      const buttonMsg: any = {
+        text: body,
+        footer: footer || '',
+        buttons: buttons.map(b => ({
+          buttonId: b.buttonId,
+          buttonText: { displayText: b.buttonText },
+          type: 1,
+        })),
+        headerType: 1,
+      };
+      await sock.sendMessage(jid, buttonMsg);
+      WhatsAppClientService.addToHistory(phone, 'bot', body.substring(0, 200));
+    } catch (err: any) {
+      console.warn('⚠️ Button mesaj gönderilemedi, düz metin fallback:', err.message);
+      // Fallback: düz metin olarak gönder
+      let fallbackText = body + '\n\n';
+      buttons.forEach(b => {
+        fallbackText += `• *${b.buttonText}*\n`;
+      });
+      if (footer) fallbackText += `\n_${footer}_`;
+      await WhatsAppClientService.reply(jid, phone, fallbackText);
+    }
+  }
+
+  // ==================== INTERACTIVE RESPONSE HANDLER ====================
+
+  private static async handleInteractiveResponse(jid: string, selectedId: string): Promise<void> {
+    try {
+      const phone = WhatsAppClientService.myJid.split('@')[0];
+      console.log(`🔘 Interactive seçim: ${selectedId}`);
+      WhatsAppClientService.addToHistory(phone, 'user', `[Seçim: ${selectedId}]`);
+
+      const pending = WhatsAppClientService.pendingTasks.get(phone);
+
+      // ── Interval seçimi ──
+      if (selectedId.startsWith('interval_')) {
+        if (!pending || pending.type !== 'interval') {
+          await WhatsAppClientService.reply(jid, phone, '⚠️ Aktif bir görev oluşturma işlemi yok.');
+          return;
+        }
+        const intervalMap: Record<string, { repeatType: RepeatType; intervalDays: number | null }> = {
+          'interval_once': { repeatType: 'ONCE', intervalDays: null },
+          'interval_daily': { repeatType: 'DAILY', intervalDays: null },
+          'interval_weekly': { repeatType: 'WEEKLY', intervalDays: null },
+          'interval_monthly': { repeatType: 'MONTHLY', intervalDays: null },
+        };
+
+        const selected = intervalMap[selectedId];
+        if (!selected) {
+          // interval_custom → kullanıcıdan yazarak almamız gerekiyor
+          await WhatsAppClientService.reply(jid, phone, '📝 Kaç günde bir tekrar etsin? Örn: *45 günde bir*');
+          return;
+        }
+
+        const nextDueAt = pending.date ? new Date(pending.date) : new Date();
+        if (pending.time) {
+          const [h, m] = pending.time.split(':').map(Number);
+          nextDueAt.setHours(h, m, 0, 0);
+        }
+        const task = await TaskService.create({
+          userId: pending.userId,
+          title: pending.title,
+          repeatType: selected.repeatType,
+          repeatIntervalDays: selected.intervalDays || undefined,
+          nextDueAt,
+        });
+        if (pending.time) {
+          await prisma.task.update({ where: { id: task.id }, data: { dueTime: pending.time } });
+        }
+        let reply = `✅ Görev oluşturuldu!\n\n*${task.title}*`;
+        reply += `\n🔁 ${getRepeatLabel(selected.repeatType, selected.intervalDays)}`;
+        if (pending.time) reply += `\n⏰ Saat: ${pending.time}`;
+        await WhatsAppClientService.reply(jid, phone, reply);
+        WhatsAppClientService.pendingTasks.delete(phone);
+        return;
+      }
+
+      // ── Medya onay seçimi ──
+      if (selectedId.startsWith('media_')) {
+        if (!pending || pending.type !== 'media_confirmation') {
+          await WhatsAppClientService.reply(jid, phone, '⚠️ Aktif bir onay bekleyen işlem yok.');
+          return;
+        }
+
+        if (selectedId === 'media_yes') {
+          const actions = pending.proposedActions || [];
+          const createdTasks: string[] = [];
+          for (const a of actions) {
+            const nextDueAt = a.date ? new Date(a.date) : undefined;
+            if (nextDueAt && a.time) {
+              const [h, m] = a.time.split(':').map(Number);
+              nextDueAt.setHours(h, m, 0, 0);
+            }
+            const task = await TaskService.create({
+              userId: pending.userId,
+              title: a.title,
+              repeatType: (a.repeatType as any) || 'ONCE',
+              nextDueAt: nextDueAt || undefined,
+            });
+            if (a.time || a.location) {
+              await prisma.task.update({
+                where: { id: task.id },
+                data: {
+                  ...(a.time ? { dueTime: a.time } : {}),
+                  ...(a.location ? { location: a.location } : {}),
+                },
+              });
+            }
+            const dateStr = nextDueAt ? `📅 ${nextDueAt.toLocaleDateString('tr-TR')}` : '⏳ Zamansız';
+            createdTasks.push(`✅ ${a.title} — ${dateStr}${a.time ? ` ⏰${a.time}` : ''}${a.location ? ` 📍${a.location}` : ''}`);
+          }
+          let reply = `🎉 *${createdTasks.length} görev oluşturuldu!*\n\n`;
+          createdTasks.forEach(t => { reply += `${t}\n`; });
+          await WhatsAppClientService.reply(jid, phone, reply);
+          WhatsAppClientService.pendingTasks.delete(phone);
+          return;
+        } else if (selectedId === 'media_no') {
+          await WhatsAppClientService.reply(jid, phone, '❌ Görevler iptal edildi.');
+          WhatsAppClientService.pendingTasks.delete(phone);
+          return;
+        } else if (selectedId === 'media_edit') {
+          await WhatsAppClientService.reply(jid, phone, '✏️ Düzenlemek istediğiniz görevleri yazıyla belirtin veya medyayı tekrar gönderin.');
+          WhatsAppClientService.pendingTasks.delete(phone);
+          return;
+        }
+      }
+
+      // ── Görev tamamlama seçimi ──
+      if (selectedId.startsWith('complete_task_')) {
+        const taskId = selectedId.replace('complete_task_', '');
+        const userData = await TaskService.findTasksByUserPhone(phone);
+        if (!userData) return;
+        const { user } = userData;
+
+        try {
+          const completed = await TaskService.complete(taskId, user.id);
+          let cReply = `🎉 Tebrikler! Görev tamamlandı:\n\n*${completed.title}*`;
+          if (completed.nextDueAt) {
+            cReply += `\n\n📅 Sonraki tarih: ${completed.nextDueAt.toLocaleDateString('tr-TR')}`;
+          }
+          await WhatsAppClientService.reply(jid, phone, cReply);
+        } catch {
+          await WhatsAppClientService.reply(jid, phone, '❓ Görev bulunamadı veya zaten tamamlanmış.');
+        }
+        WhatsAppClientService.pendingTasks.delete(phone);
+        return;
+      }
+
+      // ── Görev filtre seçimi ──
+      if (selectedId.startsWith('filter_')) {
+        const userData = await TaskService.findTasksByUserPhone(phone);
+        if (!userData) return;
+        const { user, tasks } = userData;
+
+        let tasksToList = tasks;
+        let listTitle = '*Görevleriniz*';
+
+        if (selectedId === 'filter_today') {
+          const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+          const todayEnd = new Date(); todayEnd.setHours(23, 59, 59, 999);
+          tasksToList = tasks.filter(t => {
+            if (!t.nextDueAt) return false;
+            const d = new Date(t.nextDueAt);
+            return d >= todayStart && d <= todayEnd;
+          });
+          listTitle = `*Bugünkü Görevleriniz* 📅`;
+        } else if (selectedId === 'filter_tomorrow') {
+          const tmrw = new Date(); tmrw.setDate(tmrw.getDate() + 1);
+          tmrw.setHours(0, 0, 0, 0);
+          const tmrwEnd = new Date(tmrw); tmrwEnd.setHours(23, 59, 59, 999);
+          tasksToList = tasks.filter(t => {
+            if (!t.nextDueAt) return false;
+            const d = new Date(t.nextDueAt);
+            return d >= tmrw && d <= tmrwEnd;
+          });
+          listTitle = `*Yarınki Görevleriniz* 📅`;
+        } else if (selectedId === 'filter_week') {
+          const weekEnd = new Date(); weekEnd.setDate(weekEnd.getDate() + 7);
+          tasksToList = tasks.filter(t => {
+            if (!t.nextDueAt) return false;
+            return new Date(t.nextDueAt) <= weekEnd;
+          });
+          listTitle = `*Bu Haftaki Görevleriniz* 📅`;
+        } else if (selectedId === 'filter_timeless') {
+          tasksToList = tasks.filter(t => !t.nextDueAt);
+          listTitle = `*Zamansız Görevleriniz* ⏳`;
+        }
+        // filter_all → tasksToList zaten tüm görevler
+
+        if (tasksToList.length === 0) {
+          await WhatsAppClientService.reply(jid, phone, `📭 ${listTitle} — Bekleyen göreviniz yok!`);
+          return;
+        }
+
+        let lReply = `📋 ${listTitle}\n\n`;
+        tasksToList.forEach((t, i) => {
+          const date = t.nextDueAt ? t.nextDueAt.toLocaleDateString('tr-TR') : '⏳ Zamansız';
+          const time = (t as any).dueTime ? ` ⏰${(t as any).dueTime}` : '';
+          const loc = (t as any).location ? ` 📍${(t as any).location}` : '';
+          const repeat = (t as any).repeatType && (t as any).repeatType !== 'ONCE' ? ` 🔁` : '';
+          lReply += `${i + 1}. ${t.title} — ${date}${time}${loc}${repeat}\n`;
+        });
+        await WhatsAppClientService.reply(jid, phone, lReply);
+        return;
+      }
+
+      // Bilinmeyen interactive response
+      await WhatsAppClientService.reply(jid, phone, '❓ Seçim anlaşılamadı. Lütfen tekrar deneyin.');
+    } catch (error: any) {
+      console.error('❌ Interactive response hatası:', error.message);
+    }
   }
 
   // Send message to a phone number (used by scheduler)
@@ -318,7 +599,6 @@ export class WhatsAppClientService {
         if (t.location) preview += ` 📍 ${t.location}`;
         preview += '\n';
       });
-      preview += '\n✅ Onaylıyor musunuz? (*evet* / *hayır* / *düzenle*)';
 
       // Pending state'e kaydet
       WhatsAppClientService.pendingTasks.set(phone, {
@@ -331,7 +611,18 @@ export class WhatsAppClientService {
         createdAt: Date.now(),
       });
 
-      await WhatsAppClientService.reply(jid, phone, preview);
+      // Interactive button mesajı ile onay iste
+      await WhatsAppClientService.sendButtonMessage(
+        jid,
+        phone,
+        preview,
+        [
+          { buttonId: 'media_yes', buttonText: 'Onayla ✅' },
+          { buttonId: 'media_no', buttonText: 'İptal ❌' },
+          { buttonId: 'media_edit', buttonText: 'Düzenle ✏️' },
+        ],
+        'Görevleri onaylamak için bir seçenek seçin',
+      );
     } catch (error: any) {
       console.error('❌ Medya işleme hatası:', error.message);
       const phone = WhatsAppClientService.myJid.split('@')[0];
@@ -514,9 +805,23 @@ export class WhatsAppClientService {
                 userId: user.id,
                 createdAt: Date.now(),
               });
-              await WhatsAppClientService.reply(jid, phone,
-                `📝 *${action.title}*\n\nBu görev ne sıklıkla tekrar etsin?\n\n` +
-                '• *tek seferlik*\n• *günlük*\n• *haftalık*\n• *aylık*\n• *X günde bir* (örn: 45 günde bir)'
+              // Interactive list ile tekrar sıklığı sor
+              await WhatsAppClientService.sendListMessage(
+                jid,
+                phone,
+                `📝 *${action.title}*\n\nBu görev ne sıklıkla tekrar etsin?`,
+                'Sıklık Seçin 🔁',
+                [{
+                  title: 'Tekrar Sıklığı',
+                  rows: [
+                    { title: 'Tek Seferlik', rowId: 'interval_once', description: 'Sadece bir kere' },
+                    { title: 'Günlük', rowId: 'interval_daily', description: 'Her gün tekrar eder' },
+                    { title: 'Haftalık', rowId: 'interval_weekly', description: 'Her hafta tekrar eder' },
+                    { title: 'Aylık', rowId: 'interval_monthly', description: 'Her ay tekrar eder' },
+                    { title: 'Özel Aralık', rowId: 'interval_custom', description: 'Örn: 45 günde bir' },
+                  ],
+                }],
+                'Bir seçenek seçin',
               );
               break;
             }
@@ -566,22 +871,47 @@ export class WhatsAppClientService {
               repeatIntervalDays: action.repeatIntervalDays || undefined,
               nextDueAt: action.date ? nextDueAt : undefined,
             });
-            if (action.time || action.location) {
+            if (action.time || action.location || action.isReminder) {
               await prisma.task.update({
                 where: { id: task.id },
-                data: { ...(action.time ? { dueTime: action.time } : {}),
+                data: {
+                  ...(action.time ? { dueTime: action.time } : {}),
                   ...(action.location ? { location: action.location } : {}),
+                  ...(action.isReminder ? { isReminder: true } : {}),
                 },
               });
             }
-            let reply = action.date
-              ? `✅ Görev oluşturuldu!\n\n*${task.title}*`
-              : `📌 Zamansız görev eklendi!\n\n*${task.title}*\n⏳ Zamanı gelince yapılacak`;
-            if (repeatType !== 'ONCE') reply += `\n🔁 ${getRepeatLabel(repeatType, action.repeatIntervalDays)}`;
-            if (action.date) reply += `\n📅 ${new Date(action.date).toLocaleDateString('tr-TR')}`;
-            if (action.time) reply += `\n⏰ Saat: ${action.time}`;
-            if (action.location) reply += `\n📍 Konum: ${action.location}`;
-            await WhatsAppClientService.reply(jid, phone, reply);
+
+            // Hatırlatma/alarm ise farklı mesaj göster
+            if (action.isReminder && action.date && action.time) {
+              const reminderDate = new Date(action.date);
+              const now = new Date();
+              const [rh, rm] = action.time.split(':').map(Number);
+              reminderDate.setHours(rh, rm, 0, 0);
+              const diffMs = reminderDate.getTime() - now.getTime();
+              const diffMin = Math.round(diffMs / 60000);
+              let timeLeft = '';
+              if (diffMin >= 60) {
+                const hours = Math.floor(diffMin / 60);
+                const mins = diffMin % 60;
+                timeLeft = mins > 0 ? `${hours} saat ${mins} dakika` : `${hours} saat`;
+              } else {
+                timeLeft = `${diffMin} dakika`;
+              }
+              let reply = `🔔 Hatırlatıcı kuruldu!\n\n*${task.title}*`;
+              reply += `\n⏰ ${action.time} — ${reminderDate.toLocaleDateString('tr-TR')}`;
+              reply += `\n⏳ ${timeLeft} sonra bildirim alacaksınız`;
+              await WhatsAppClientService.reply(jid, phone, reply);
+            } else {
+              let reply = action.date
+                ? `✅ Görev oluşturuldu!\n\n*${task.title}*`
+                : `📌 Zamansız görev eklendi!\n\n*${task.title}*\n⏳ Zamanı gelince yapılacak`;
+              if (repeatType !== 'ONCE') reply += `\n🔁 ${getRepeatLabel(repeatType, action.repeatIntervalDays)}`;
+              if (action.date) reply += `\n📅 ${new Date(action.date).toLocaleDateString('tr-TR')}`;
+              if (action.time) reply += `\n⏰ Saat: ${action.time}`;
+              if (action.location) reply += `\n📍 Konum: ${action.location}`;
+              await WhatsAppClientService.reply(jid, phone, reply);
+            }
             break;
           }
 
@@ -602,9 +932,38 @@ export class WhatsAppClientService {
             }
 
             if (!matchingTask) {
-              await WhatsAppClientService.reply(jid, phone,
-                `❓ Eşleşen görev bulunamadı. Görevlerinizi görmek için "görevlerimi listele" yazın.`
-              );
+              // Görev bulunamadı → interactive list ile seçtir
+              if (tasks.length > 0) {
+                WhatsAppClientService.pendingTasks.set(phone, {
+                  type: 'task_complete_select',
+                  title: '',
+                  date: null,
+                  time: null,
+                  userId: user.id,
+                  createdAt: Date.now(),
+                });
+                await WhatsAppClientService.sendListMessage(
+                  jid,
+                  phone,
+                  '🎯 Hangi görevi tamamladınız?',
+                  'Görev Seçin ✅',
+                  [{
+                    title: 'Aktif Görevler',
+                    rows: tasks.slice(0, 10).map((t, i) => ({
+                      title: t.title.substring(0, 24),
+                      rowId: `complete_task_${t.id}`,
+                      description: t.nextDueAt
+                        ? `📅 ${t.nextDueAt.toLocaleDateString('tr-TR')}${(t as any).dueTime ? ` ⏰${(t as any).dueTime}` : ''}`
+                        : '⏳ Zamansız',
+                    })),
+                  }],
+                  'Tamamlamak istediğiniz görevi seçin',
+                );
+              } else {
+                await WhatsAppClientService.reply(jid, phone,
+                  '📭 Bekleyen göreviniz yok!'
+                );
+              }
               break;
             }
 
@@ -618,6 +977,28 @@ export class WhatsAppClientService {
           }
 
           case 'list_tasks': {
+            // Belirli bir tarih veya filtre yoksa → interactive filtre sun
+            if (!action.date) {
+              await WhatsAppClientService.sendListMessage(
+                jid,
+                phone,
+                '📋 Görevlerinizi nasıl listelemek istersiniz?',
+                'Filtre Seçin 📊',
+                [{
+                  title: 'Görev Filtresi',
+                  rows: [
+                    { title: 'Bugünkü Görevler', rowId: 'filter_today', description: '📅 Bugün yapılacaklar' },
+                    { title: 'Yarınki Görevler', rowId: 'filter_tomorrow', description: '📅 Yarın yapılacaklar' },
+                    { title: 'Bu Hafta', rowId: 'filter_week', description: '📅 7 gün içindekiler' },
+                    { title: 'Tüm Görevler', rowId: 'filter_all', description: '📋 Tüm bekleyen görevler' },
+                    { title: 'Zamansız Görevler', rowId: 'filter_timeless', description: '⏳ Tarihi belirsiz görevler' },
+                  ],
+                }],
+                'Görmek istediğiniz görevleri seçin',
+              );
+              break;
+            }
+
             let tasksToList = tasks;
             let listTitle = '*Görevleriniz*';
 
