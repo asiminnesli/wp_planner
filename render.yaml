@@ -1,28 +1,33 @@
 services:
   - type: web
     name: wp-planner
-    runtime: node
+    runtime: docker
     region: frankfurt
     plan: starter
-    buildCommand: npm run install:all && npm run build
-    startCommand: npm run start
+    dockerfilePath: ./Dockerfile
     healthCheckPath: /api/health
     envVars:
       - key: NODE_ENV
         value: production
       - key: DATABASE_URL
-        value: file:./data/prod.db
+        # Render disk /app/backend/data'ya mount edildiğinde bu path çalışır
+        value: file:/app/backend/data/prod.db
       - key: JWT_SECRET
         generateValue: true
       - key: JWT_EXPIRES_IN
         value: 7d
-      - key: GEMINI_API_KEY
-        value: optional
       - key: PORT
-        value: 10000
+        value: 3000
       - key: FRONTEND_URL
+        # Deploy sonrası Render'ın verdiği URL'i buraya yaz
+        # Örnek: https://wp-planner.onrender.com
+        sync: false
+      - key: GEMINI_API_KEY
+        # Opsiyonel: global fallback key, kullanıcılar kendi key'lerini girebilir
         sync: false
     disk:
       name: wp-planner-data
-      mountPath: /opt/render/project/src/backend/data
+      # Bu path container içindeki /app/backend/data klasörüne mount edilir
+      # SQLite DB ve WhatsApp (Baileys) auth dosyaları burada saklanır
+      mountPath: /app/backend/data
       sizeGB: 1

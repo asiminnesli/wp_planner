@@ -14,6 +14,9 @@ FROM node:20-alpine AS backend-builder
 
 WORKDIR /app/backend
 
+# Prisma binary target için gerekli (alpine linux)
+ENV PRISMA_CLI_BINARY_TARGETS="linux-musl-openssl-3.0.x"
+
 COPY backend/package*.json ./
 COPY backend/prisma ./prisma/
 
@@ -39,8 +42,13 @@ COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
 
 WORKDIR /app/backend
 
+# Kalıcı data klasörünü oluştur (Render disk buraya mount edilecek)
+# SQLite DB + Baileys auth burada saklanır
+RUN mkdir -p /app/backend/data
+
 ENV NODE_ENV=production
 
 EXPOSE 3000
 
-CMD ["sh", "-c", "npx prisma db push --accept-data-loss && node dist/index.js"]
+# db push: SQLite için migrate yerine push kullan (schema'yı otomatik uygular)
+CMD ["sh", "-c", "npx prisma db push --skip-generate && node dist/index.js"]

@@ -3,7 +3,7 @@ generator client {
 }
 
 datasource db {
-  provider = "postgresql"
+  provider = "sqlite"
   url      = env("DATABASE_URL")
 }
 
@@ -27,7 +27,7 @@ model Task {
   id                 String   @id @default(uuid())
   userId             String   @map("user_id")
   title              String
-  description        String?  @db.Text
+  description        String?
   status             String   @default("PENDING")
   priority           String   @default("MEDIUM")
   repeatType         String   @default("ONCE") @map("repeat_type")
