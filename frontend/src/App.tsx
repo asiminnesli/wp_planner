@@ -8,6 +8,7 @@ import Tasks from './pages/Tasks';
 import CalendarPage from './pages/Calendar';
 import Settings from './pages/Settings';
 import Setup from './pages/Setup';
+import { AdminPage } from './pages/AdminPage';
 import './index.css';
 
 const isSetupComplete = (user: any): boolean => {
@@ -93,6 +94,7 @@ const AppRoutes = () => (
     <Route path="/login" element={<PublicRoute><Login /></PublicRoute>} />
     <Route path="/register" element={<PublicRoute><Register /></PublicRoute>} />
     <Route path="/setup" element={<SetupRoute><Setup /></SetupRoute>} />
+    <Route path="/admin" element={<AdminPage />} />
     <Route path="/" element={
       <ProtectedRoute>
         <AppLayout><Dashboard /></AppLayout>

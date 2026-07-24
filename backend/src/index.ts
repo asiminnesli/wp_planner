@@ -30,23 +30,13 @@ app.get('/api/health', (_req, res) => {
   });
 });
 
+import adminRoutes from './routes/admin.routes';
+
 // API Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/tasks', taskRoutes);
 app.use('/api/whatsapp', whatsappRoutes);
-
-// GEÇİCİ: Render.com üzerindeki kullanıcıları görmek için endpoint
-import prisma from './config/database';
-app.get('/api/users/export', async (req, res) => {
-  try {
-    const users = await prisma.user.findMany({
-      select: { id: true, name: true, email: true, phone: true, createdAt: true }
-    });
-    res.json({ count: users.length, users });
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to fetch users', details: String(error) });
-  }
-});
+app.use('/api/admin', adminRoutes);
 
 // Frontend static dosyalarını serve et (dist varsa)
 {
