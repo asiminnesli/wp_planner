@@ -1,3 +1,6 @@
+// Enforce Turkey Time (GMT+3) globally for this Node.js process
+process.env.TZ = 'Europe/Istanbul';
+
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';

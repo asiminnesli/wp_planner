@@ -56,7 +56,7 @@ router.put('/users/:id', adminMiddleware, async (req, res) => {
     }
 
     const updatedUser = await prisma.user.update({
-      where: { id },
+      where: { id: id as string },
       data: dataToUpdate,
       select: {
         id: true,

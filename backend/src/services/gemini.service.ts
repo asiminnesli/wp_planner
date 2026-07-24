@@ -31,6 +31,7 @@ const SYSTEM_PROMPT = `Sen bir görev yönetim asistanısın. Kullanıcının Wh
 1. SADECE JSON döndür, başka bir şey yazma.
 2. Her zaman bir JSON objesi döndür: { "actions": [...] }
 3. actions dizisi 1 veya daha fazla aksiyon içerebilir.
+4. ZAMAN DİLİMİ KESİN KURALI: Tüm saatler, tarihler ve zaman hesaplamaları KESİNLİKLE GMT+3 (Türkiye Saati) olarak kabul edilmelidir. Asla UTC kullanma.
 
 AKSIYON TİPLERİ:
 
@@ -155,9 +156,15 @@ export class GeminiService {
         : this.defaultGenAI;
       const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
 
-      const now = new Date();
-      const today = now.toISOString().split('T')[0];
-      const tomorrow = new Date(Date.now() + 86400000).toISOString().split('T')[0];
+      // Tarihleri Europe/Istanbul (GMT+3) saat dilimine göre hesapla
+      const now = new Date(new Date().toLocaleString("en-US", {timeZone: "Europe/Istanbul"}));
+      const year = now.getFullYear();
+      const month = String(now.getMonth() + 1).padStart(2, '0');
+      const date = String(now.getDate()).padStart(2, '0');
+      const today = `${year}-${month}-${date}`;
+      
+      const tom = new Date(now.getTime() + 86400000);
+      const tomorrow = `${tom.getFullYear()}-${String(tom.getMonth() + 1).padStart(2, '0')}-${String(tom.getDate()).padStart(2, '0')}`;
 
       const dayNames = ['Pazar', 'Pazartesi', 'Salı', 'Çarşamba', 'Perşembe', 'Cuma', 'Cumartesi'];
       const currentDayName = dayNames[now.getDay()];
@@ -264,8 +271,12 @@ export class GeminiService {
         : this.defaultGenAI;
       const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
 
-      const now = new Date();
-      const today = now.toISOString().split('T')[0];
+      // Tarihleri Europe/Istanbul (GMT+3) saat dilimine göre hesapla
+      const now = new Date(new Date().toLocaleString("en-US", {timeZone: "Europe/Istanbul"}));
+      const year = now.getFullYear();
+      const month = String(now.getMonth() + 1).padStart(2, '0');
+      const date = String(now.getDate()).padStart(2, '0');
+      const today = `${year}-${month}-${date}`;
       const dayNames = ['Pazar', 'Pazartesi', 'Salı', 'Çarşamba', 'Perşembe', 'Cuma', 'Cumartesi'];
       const currentDayName = dayNames[now.getDay()];
 
